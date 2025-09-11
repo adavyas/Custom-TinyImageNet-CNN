@@ -1,0 +1,4 @@
+env/
+another.pt
+data/
+checkpoints/best_fmnist_ema.pt
