@@ -36,6 +36,8 @@ else:
     device = torch.device("cpu")
     log.warning("Using CPU ⚠️")
 
+
+
 # ----------------------------------------------------------
 # Paths
 # ----------------------------------------------------------
@@ -95,6 +97,9 @@ log.info("Loading datasets...")
 train_set = datasets.ImageFolder(os.path.join(data_root, "train"), transform=train_tf)
 val_set   = datasets.ImageFolder(os.path.join(data_root, "val"),   transform=test_tf)
 
+assert train_set.classes == val_set.classes
+
+
 log.info(f"Train samples: {len(train_set)}")
 log.info(f"Val samples:   {len(val_set)}")
 
@@ -114,18 +119,20 @@ class TinyCNN(nn.Module):
             nn.MaxPool2d(2),
 
             nn.Conv2d(32, 64, 3, padding=1),
-            #nn.GroupNorm(32, 64),
+            #nn.GroupNorm(2, 64),
             nn.ReLU(),
             nn.MaxPool2d(2),
 
             nn.Conv2d(64, 128, 3, padding=1),
-            #nn.GroupNorm(64, 128), 
+            #nn.GroupNorm(4, 128), 
             nn.ReLU(),
             nn.MaxPool2d(2),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 8 * 8, 256), nn.ReLU(),
+            nn.Linear(128 * 8 * 8, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(256, num_classes),
         )
 
@@ -144,7 +151,24 @@ log.info(f"Total parameters: {total_params:,}")
 # Optimizer / Loss / Scheduler
 # ----------------------------------------------------------
 criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+
+decay, no_decay = [], []
+for name, param in model.named_parameters():
+    # 1D params = biases + GroupNorm scale/shift (gamma/beta)
+    if param.ndim == 1 or name.endswith(".bias"):
+        no_decay.append(param)
+    else:
+        decay.append(param)
+
+optimizer = torch.optim.AdamW(
+    [
+        {"params": decay, "weight_decay": 1e-4},
+        {"params": no_decay, "weight_decay": 0.0},
+    ],
+    lr=1e-3,
+)
+
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.6, step_size=10)
 
 @torch.no_grad()

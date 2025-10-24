@@ -5,3 +5,4 @@ checkpoints/best_fmnist_ema.pt
 logs/
 test.py
 best_tiny_cnn.pt
+modify.py
