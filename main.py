@@ -115,24 +115,24 @@ class TinyCNN(nn.Module):
         self.features = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.GroupNorm(1, 32),
-            nn.GELU(),
-            nn.AvgPool2d(2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
 
             nn.Conv2d(32, 64, 3, padding=1),
             #nn.GroupNorm(2, 64),
-            nn.GELU(),
-            nn.AvgPool2d(2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
 
             nn.Conv2d(64, 128, 3, padding=1),
             #nn.GroupNorm(4, 128), 
-            nn.GELU(),
-            nn.AvgPool2d(2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(128 * 8 * 8, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             nn.Linear(256, num_classes),
         )
 
@@ -188,7 +188,7 @@ def evaluate(loader):
 # ----------------------------------------------------------
 # Training Loop
 # ----------------------------------------------------------
-epochs = 20
+epochs = 5
 best_acc = 0.0
 
 log.info(f"Training for {epochs} epochs...")
