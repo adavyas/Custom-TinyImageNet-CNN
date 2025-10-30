@@ -131,7 +131,7 @@ def evaluate(model, loader, criterion):
 # ----------------------------------------------------------
 # Train
 # ----------------------------------------------------------
-def train_tiny_cnn(lr=1e-3, weight_decay=1e-4, dropout=0.2, epochs=5):
+def train_tiny_cnn(lr=0.00254, weight_decay=9.86e-6, dropout=0.1, epochs=50):
     log.info(f"Initializing training with lr={lr}, weight_decay={weight_decay}, dropout={dropout}")
     train_loader, val_loader = load_tiny_imagenet_data()
     model = TinyCNN(dropout=dropout).to(device)
@@ -144,8 +144,7 @@ def train_tiny_cnn(lr=1e-3, weight_decay=1e-4, dropout=0.2, epochs=5):
         [{"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
         lr=lr
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.6, step_size=10)
-
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=100, eta_min=1e-6)
     total_params = sum(p.numel() for p in model.parameters())
     log.info(f"Total parameters: {total_params:,}")
     best_acc = 0.0
