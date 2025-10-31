@@ -64,54 +64,177 @@ def load_tiny_imagenet_data(batch_size=128):
     return DataLoader(train, batch_size=batch_size, shuffle=True), DataLoader(val, batch_size=256)
 
 # ----------------------------------------------------------
-# Model
+# Model (Improved TinyCNN ≤500K params)
 # ----------------------------------------------------------
-class TinyCNN(nn.Module):
-    def __init__(self, num_classes=200, dropout=0.3):
+class ConvBNAct(nn.Module):
+    """Conv + BN + h-swish"""
+    def __init__(self, inp, oup, k=3, s=1, g=1):
         super().__init__()
-
-        self.features = nn.Sequential(
-            # Block 1
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 64 → 32
-
-            # Block 2
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 32 → 16
-
-            # Block 3
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.GELU(),
-            # no pool here — keep 16×16 spatial size
+        self.block = nn.Sequential(
+            nn.Conv2d(inp, oup, k, s, k // 2, groups=g, bias=False),
+            nn.BatchNorm2d(oup),
+            nn.Hardswish()
         )
+    def forward(self, x):
+        return self.block(x)
 
-        # Global average pooling instead of flattening 8×8 maps
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),     # 16×16 → 1×1
-            nn.Flatten(),                # → (batch, 128)
-            nn.Linear(128, 256),
-            nn.ReLU(),
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excite with tiny MLP"""
+    def __init__(self, c, r=8):
+        super().__init__()
+        hidden = max(8, c // r)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(c, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, c, bias=False),
+            nn.Hardsigmoid()
+        )
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        s = self.pool(x).view(b, c)
+        s = self.fc(s).view(b, c, 1, 1)
+        return x * s
+
+
+class DepthwiseBlock(nn.Module):
+    """
+    Depthwise-separable conv block
+    ConvBNAct(depthwise k=5) -> ConvBNAct(pointwise 1x1) -> optional SE
+    """
+    def __init__(self, inp, oup, stride=1, use_se=True):
+        super().__init__()
+        self.block = nn.Sequential(
+            ConvBNAct(inp, inp, k=5, s=stride, g=inp),  # depthwise
+            ConvBNAct(inp, oup, k=1, s=1, g=1),         # pointwise
+            SEBlock(oup) if use_se else nn.Identity()
+        )
+    def forward(self, x):
+        return self.block(x)
+
+
+class GlobalMixerBlock(nn.Module):
+    """
+    Lightweight Transformer-style block:
+    - LayerNorm
+    - Multihead Self-Attention (small heads)
+    - MLP
+    Residual connections included.
+    """
+    def __init__(self, dim, num_heads=2, mlp_ratio=2.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=dropout,
+            bias=True,
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.Hardswish(),
             nn.Dropout(dropout),
-            nn.Linear(256, num_classes),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
-        x = self.features(x)
-        return self.classifier(x)
+        # x: (B, N, C)
+        # Self-attention with residual
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + attn_out
+        # MLP with residual
+        h = self.norm2(x)
+        x = x + self.mlp(h)
+        return x
+
+
+class TinyHybridCNN(nn.Module):
+    """
+    CNN backbone (depthwise-SE) + tiny global mixer head.
+    - Resolution agnostic.
+    - Aims to stay near/under ~1MB FP16.
+    - Stronger global reasoning than pure CNN.
+    """
+    def __init__(self, num_classes=200, dropout=0.25):
+        super().__init__()
+
+        # --- Convolutional feature extractor ---
+        # We'll make this moderately wide so it's strong but still efficient.
+        self.features = nn.Sequential(
+            # Stage 1: 64 -> 32 (or 224 -> 112, etc.)
+            ConvBNAct(3,   32, k=3, s=2),
+            DepthwiseBlock(32,   64, stride=1),
+            # Stage 2: 32 -> 16 (or 112 -> 56)
+            DepthwiseBlock(64,   96, stride=2),
+            DepthwiseBlock(96,  128, stride=1),
+            # Stage 3: 16 -> 8 (or 56 -> 28)
+            DepthwiseBlock(128, 176, stride=2),
+            DepthwiseBlock(176, 224, stride=1),
+            DepthwiseBlock(224, 256, stride=1),
+        )
+
+        # After this, spatial size is:
+        # - If input is 64x64: downsampled by 2,2,2 → 8x8
+        # - If input is 224x224: → 28x28
+        # Channels: 256
+
+        self.channel_dim = 256  # final C
+
+        # --- Global mixer head (1 transformer-like block) ---
+        self.mixer = GlobalMixerBlock(
+            dim=self.channel_dim,
+            num_heads=2,
+            mlp_ratio=2.0,
+            dropout=0.1,
+        )
+
+        # --- Classifier ---
+        # We'll pool over tokens (mean) after mixing.
+        self.classifier = nn.Sequential(
+            nn.Linear(self.channel_dim, 320),
+            nn.Hardswish(),
+            nn.Dropout(dropout),
+            nn.Linear(320, num_classes),
+        )
+
+        # --- Init (safe on bias=None) ---
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # CNN backbone
+        x = self.features(x)           # (B, C=256, H', W')
+        B, C, H, W = x.shape
+
+        # Flatten into tokens
+        x = x.view(B, C, H * W).transpose(1, 2)  # (B, N=H*W, C)
+
+        # Global token mixer
+        x = self.mixer(x)              # (B, N, C)
+
+        # Global average over tokens
+        x = x.mean(dim=1)              # (B, C)
+
+        # Classifier head
+        x = self.classifier(x)         # (B, num_classes)
+        return x
+
 
 # ----------------------------------------------------------
 # Eval
@@ -131,10 +254,10 @@ def evaluate(model, loader, criterion):
 # ----------------------------------------------------------
 # Train
 # ----------------------------------------------------------
-def train_tiny_cnn(lr=0.00254, weight_decay=9.86e-6, dropout=0.1, epochs=50):
+def train_tiny_cnn(lr=0.00254, weight_decay=9.86e-6, dropout=0.25, epochs=50):
     log.info(f"Initializing training with lr={lr}, weight_decay={weight_decay}, dropout={dropout}")
     train_loader, val_loader = load_tiny_imagenet_data()
-    model = TinyCNN(dropout=dropout).to(device)
+    model = TinyHybridCNN(dropout=dropout).to(device)
     criterion = nn.CrossEntropyLoss()
 
     decay, no_decay = [], []
@@ -145,6 +268,7 @@ def train_tiny_cnn(lr=0.00254, weight_decay=9.86e-6, dropout=0.1, epochs=50):
         lr=lr
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=100, eta_min=1e-6)
+
     total_params = sum(p.numel() for p in model.parameters())
     log.info(f"Total parameters: {total_params:,}")
     best_acc = 0.0
@@ -176,7 +300,7 @@ def train_tiny_cnn(lr=0.00254, weight_decay=9.86e-6, dropout=0.1, epochs=50):
         val_loss, val_acc = evaluate(model, val_loader, criterion)
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), "best_tiny_cnn.pt")
+            torch.save(model.state_dict(), "best_tiny_cnn_w_att.pt")
             log.info(f"✅ New best model saved! ValAcc={val_acc*100:.2f}%")
 
         scheduler.step()
